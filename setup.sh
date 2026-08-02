@@ -179,16 +179,38 @@ setup_plugin \
 # --- .zshrc の作成と編集 ---
 ZSHRC_PATH="$HOME/.zshrc"
 BACKUP_PATH="${ZSHRC_PATH}.bak.$(date +%Y%m%d%H%M%S)"
+ZSH_INIT_MARKER_BEGIN="# >>> zsh_init >>>"
+ZSH_INIT_MARKER_END="# <<< zsh_init <<<"
 
 if [ -f "$ZSHRC_PATH" ]; then
     log_info "既存の .zshrc をバックアップしています: $BACKUP_PATH"
     cp "$ZSHRC_PATH" "$BACKUP_PATH"
 fi
 
+if [ -f "$HOME/.bashrc" ]; then
+    log_info "既存の .bashrc を検出しました。エイリアスや PATH 等を .zshrc へ引き継ぎます。"
+else
+    log_warning ".bashrc が見つかりません。bash 設定の引き継ぎはスキップされます。"
+fi
+
 log_info ".zshrc に設定を書き込んでいます..."
 
-# 書き込む設定ブロック
+# 書き込む設定ブロック（マーカーで囲み、再実行時に置換できるようにする）
 cat << 'EOF' > temp_zshrc_block
+# >>> zsh_init >>>
+
+# ==========================================
+# Inherit settings from existing ~/.bashrc
+# ==========================================
+# bash 固有の組み込みを無害化し、alias / export PATH 等を引き継ぐ。
+# 履歴や補完など zsh 側の設定は、この後のブロックで上書きする。
+if [ -f "$HOME/.bashrc" ]; then
+  shopt() { :; }
+  complete() { :; }
+  # shellcheck disable=SC1090,SC1091
+  source "$HOME/.bashrc"
+  unfunction shopt complete 2>/dev/null || true
+fi
 
 # ==========================================
 # Fish-like environment settings for Zsh
@@ -251,7 +273,7 @@ if (( $+commands[zellij] )); then
   # 自動起動を有効にしたい場合は、以下のコメントアウトを解除するか、
   # 環境変数 ZELLIJ_AUTO_START=true を設定してください。
   # export ZELLIJ_AUTO_START=true
-  
+
   if [[ -z "$ZELLIJ" && -z "$SSH_CONNECTION" && "${ZELLIJ_AUTO_START:-false}" == "true" ]]; then
     exec zellij
   fi
@@ -270,19 +292,68 @@ if [ -f "$HOME/.zsh/zsh-syntax-highlighting/zsh-syntax-highlighting.zsh" ]; then
   source "$HOME/.zsh/zsh-syntax-highlighting/zsh-syntax-highlighting.zsh"
 fi
 
+# <<< zsh_init <<<
 EOF
 
-# 既存の .zshrc がある場合、重複して追加しないようにブロックを削除または追記する
-if [ -f "$ZSHRC_PATH" ]; then
-    # すでに設定ブロックが書き込まれているかチェック
-    if grep -q "Fish-like environment settings for Zsh" "$ZSHRC_PATH"; then
-        log_info "既存の設定ブロックを更新しています..."
-        log_warning ".zshrc には既に本スクリプトによる設定が含まれている可能性があります。"
-        log_warning "重複を避けるため、末尾に追記は行わず、手動で確認できるようにします。"
-        log_info "新規設定ファイルの内容は temp_zshrc_block に一時保存しました。"
-        rm temp_zshrc_block
+# .zshrc から既存の管理ブロック / 旧形式ブロックを除去する
+strip_managed_zshrc_block() {
+    local src=$1
+    local dest=$2
+
+    if grep -qF "$ZSH_INIT_MARKER_BEGIN" "$src"; then
+        awk -v begin="$ZSH_INIT_MARKER_BEGIN" -v end="$ZSH_INIT_MARKER_END" '
+            $0 == begin { skip=1; next }
+            $0 == end { skip=0; next }
+            !skip { print }
+        ' "$src" > "$dest"
+    elif grep -q "Fish-like environment settings for Zsh" "$src"; then
+        # 旧形式: Fish-like 見出し直前の区切り線からファイル末尾までを除去
+        awk '
+            BEGIN { skip=0 }
+            /^# =+[[:space:]]*$/ {
+                getline nextline
+                if (nextline ~ /Fish-like environment settings for Zsh/) {
+                    skip=1
+                    next
+                }
+                if (!skip) {
+                    print
+                    print nextline
+                }
+                next
+            }
+            skip { next }
+            { print }
+        ' "$src" > "$dest"
     else
-        cat temp_zshrc_block >> "$ZSHRC_PATH"
+        cp "$src" "$dest"
+    fi
+
+    # 末尾の連続空行を削除
+    sed -i -e :a -e '/^\n*$/{$d;N;ba' -e '}' "$dest" 2>/dev/null || true
+}
+
+# 既存の .zshrc がある場合、管理ブロックを置換または追記する
+if [ -f "$ZSHRC_PATH" ]; then
+    if grep -qF "$ZSH_INIT_MARKER_BEGIN" "$ZSHRC_PATH" || grep -q "Fish-like environment settings for Zsh" "$ZSHRC_PATH"; then
+        log_info "既存の設定ブロックを更新しています..."
+        strip_managed_zshrc_block "$ZSHRC_PATH" temp_zshrc_clean
+        if [ -s temp_zshrc_clean ]; then
+            {
+                cat temp_zshrc_clean
+                echo ""
+                cat temp_zshrc_block
+            } > "$ZSHRC_PATH"
+        else
+            cp temp_zshrc_block "$ZSHRC_PATH"
+        fi
+        rm -f temp_zshrc_clean temp_zshrc_block
+        log_success ".zshrc の設定を更新しました。"
+    else
+        {
+            echo ""
+            cat temp_zshrc_block
+        } >> "$ZSHRC_PATH"
         rm temp_zshrc_block
         log_success ".zshrc に設定を追記しました。"
     fi
